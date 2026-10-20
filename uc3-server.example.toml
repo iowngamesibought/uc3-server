@@ -1,0 +1,27 @@
+# uc3-server config. Copy to uc3-server.toml; paths are relative to this file. See README.md.
+
+# This machine's LAN address as the console sees it, e.g. 192.168.1.50.
+public_host = "CHANGE-ME"
+
+# Your own game files (AGENTS.md explains how to find them).
+executable    = "game/<main executable, decrypted>"
+patch_archive = "game/<patch data archive>"
+# Optional: the base game's text archive, for languages the patch archive lacks.
+# text_archive = "game/<text archive>"
+
+# Optional: a folder of extra static files to serve as is. Generated files take precedence.
+# data_dir = "static"
+
+# Where player uploads are kept: profiles (profiles/<online id>/...) and hosted-game records
+# (games/<id>). Uploads reach this server only through their own DNS override (see AGENTS.md).
+# storage_dir = "storage"
+
+# Address the service ports (6300-6303, 5203) bind on.
+# bind_ip = "0.0.0.0"
+
+# Coordinates sent to every console for geographic matchmaking; one shared value keeps all players
+# in one region. Not 0/0: the console reads that as "no location" and asks again every 5 s.
+# location = { lat = 1.0, lon = 1.0 }
+
+[http]
+bind = "0.0.0.0:80"

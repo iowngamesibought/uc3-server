@@ -1,0 +1,12 @@
+# Your own game files and local settings: never commit them.
+game/
+static/
+# Every local config; only the example is published.
+uc3-server*.toml
+!uc3-server.example.toml
+# Build output.
+target/
+# Player uploads (profiles, hosted-game records).
+storage/
+# Server logs.
+logs/
