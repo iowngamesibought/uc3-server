@@ -17,6 +17,7 @@ mod eula;
 mod framecipher;
 mod framed;
 mod http;
+mod listen;
 mod location;
 mod matchmaking;
 mod services;
@@ -99,12 +100,15 @@ async fn main() -> Result<()> {
 /// The update's own config module, which only the latest update's patch archive holds.
 const LATEST_UPDATE_ENTRY: &str = "dc1/net-patch18.bin";
 
+/// Whether an archive has the entry `suffix`, at its root or under a folder.
+fn holds(names: &[String], suffix: &str) -> bool {
+    names
+        .iter()
+        .any(|n| n == suffix || n.ends_with(&format!("/{suffix}")))
+}
+
 fn archive_role(names: &[String]) -> &'static str {
-    let has = |suffix: &str| {
-        names
-            .iter()
-            .any(|n| n == suffix || n.ends_with(&format!("/{suffix}")))
-    };
+    let has = |suffix: &str| holds(names, suffix);
     // The base text archive names its tables "<n>.<category>" without a path; patch archives that
     // carry text tables use full paths.
     let networking = names.iter().any(|n| {
@@ -146,6 +150,20 @@ fn list_archive(file: &Path, all: bool) -> Result<()> {
 
 /// The installed online config module with every server host pointed at public_host.
 fn served_module(cfg: &config::Config, patch: &[u8]) -> Result<Vec<u8>> {
+    // Older archives (the base game's, an edition's, the update's other one) also hold a config
+    // module, but an older one: only the latest update's is served.
+    let names = archive::archive_manifest(patch).with_context(|| {
+        format!(
+            "patch_archive = {}: not a readable game archive",
+            cfg.patch_archive.display()
+        )
+    })?;
+    if !holds(&names, LATEST_UPDATE_ENTRY) {
+        anyhow::bail!(
+            "patch_archive = {}: not the latest update's patch data archive (no {LATEST_UPDATE_ENTRY}; see AGENTS.md)",
+            cfg.patch_archive.display()
+        );
+    }
     let (name, base) = archive::read_entry_by_suffix(patch, CONFIG_ENTRY).with_context(|| {
         format!(
             "patch_archive = {}: not the patch data archive (no {CONFIG_ENTRY}; see AGENTS.md)",
@@ -264,6 +282,7 @@ async fn run(config_path: &Path) -> Result<()> {
     drop(patch);
 
     let services = Arc::new(services::Services::new(Default::default()));
+    let rooms = Arc::new(matchmaking::Matchmaking::new());
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(http::serve(
         cfg.http.bind,
@@ -271,6 +290,7 @@ async fn run(config_path: &Path) -> Result<()> {
         cfg.data_dir.clone(),
         cfg.storage_dir.clone(),
         services.game_ids(),
+        rooms.clone(),
     ));
     for port in config::FRAMED_PORTS {
         tasks.spawn(framed::serve(
@@ -283,7 +303,6 @@ async fn run(config_path: &Path) -> Result<()> {
         SocketAddr::new(cfg.bind_ip, config::LOCATION_PORT),
         cfg.location,
     ));
-    let rooms = Arc::new(matchmaking::Matchmaking::new());
     tasks.spawn(matchmaking::serve(
         SocketAddr::new(cfg.bind_ip, config::MATCHMAKING_PORT),
         rooms,
@@ -297,34 +316,4 @@ async fn run(config_path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::archive_role;
-
-    #[test]
-    fn archive_roles_follow_entry_names() {
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(
-            archive_role(&names(&[
-                "build/main/bin/dc1/net.bin",
-                "build/main/bin/dc1/net-patch18.bin",
-                "build/main/text1/2.networking"
-            ]))
-            .starts_with("fits patch_archive")
-        );
-        assert!(
-            archive_role(&names(&["2.common", "2.networking"])).starts_with("fits text_archive")
-        );
-        assert!(archive_role(&names(&["dc1/net.bin", "dc1/ai.bin"])).starts_with("fits neither"));
-        // An older patch archive also carries text tables, but under full paths.
-        assert!(
-            archive_role(&names(&[
-                "build/main/bin/dc1/net.bin",
-                "build/main/text1/2.networking"
-            ]))
-            .starts_with("fits neither: a patch archive")
-        );
-        assert!(
-            archive_role(&names(&["build/main/text1/2.networking"])).starts_with("fits neither")
-        );
-    }
-}
+mod tests;

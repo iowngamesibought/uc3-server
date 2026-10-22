@@ -1,10 +1,10 @@
 # uc3-server
 
-A community server for the online mode of **UC3** on certain game console.
+A community server for the online mode of **UC3** on a certain game console.
 
 This project is not affiliated with or endorsed by the game's developer or publisher. It ships no game files: the server reads what it needs from **your own installed copy** at startup and keeps everything it derives from it in memory only.
 
-Status: tested with two consoles on one LAN. Sign-in, Find Game (competitive and co-op), custom games with invites and full matches, including the uploads after a match, all work. Leaderboards and invite lists answer with empty lists for now.
+Status: tested with two consoles on one LAN, with one edition of the game and its latest update. Sign-in, Find Game (competitive and co-op), custom games with invites and full matches, including the uploads after a match, all work. Leaderboards and invite lists answer with empty lists for now.
 
 ## What it serves
 
@@ -25,7 +25,7 @@ This README deliberately doesn't name them. No public packet captures of this ga
 
 ## Required: files from your copy of the game
 
-The server ships no game data. It needs these files from **your own installed copy**, set in the config:
+The server ships no game data. It needs these files from **your own installed copy**, set in the config. The game must have its **latest update** installed: both required files come from that update, and the base game supplies at most the optional text archive. A copy without the update won't work, and the server refuses files from any other build at startup.
 
 | Config key | What it is |
 |---|---|
@@ -74,16 +74,24 @@ cargo run --release -- run --config uc3-server.toml
   ```
   The upload host is a domain shared by many other services, so override it **for the console only**: give the console its own DNS server (for example a small dnsmasq on this machine) rather than changing the DNS of your whole network. If a proxy or TUN sits in front of the console, exempt the names from fake-IP and route them directly.
 - **public_host:** this machine's LAN address as the console sees it. The server refuses to start with a placeholder or `0.0.0.0`; the bind addresses can stay `0.0.0.0`.
-- **Firewall:** allow inbound TCP 80, 6300–6303 and 5203.
+- **Firewall:** allow inbound TCP 80, 6300–6303 and 5203 from your local network only, and don't forward these ports on your router: everything the server serves is derived from your game files.
 - **Cache:** the console caches the config keyed on `Last-Modified`. The server derives that date from the content, so restarts don't force a re-download, but any config change does.
 
 ## Tests
 
-`cargo test` covers the ciphers (standard Blowfish vector, frame cipher reference vectors, round trips), the config module changes (server addresses, terms pages, level list), archive round trips, the framed service handshake over a socket, reply sizes against the client's buffers, the matchmaking room lifecycle (create, search, join, leave, host change, reconnects, stalled clients), HTTP caching headers, upload key rules and stored-file handling, damaged input files, and config validation.
+`cargo test` covers the ciphers (standard Blowfish vector, frame cipher reference vectors, round trips), the config module changes (server addresses, terms pages, level list), archive round trips, the framed service handshake over a socket, reply sizes against the client's buffers, the matchmaking room lifecycle (create, search and its order, join, leave, host change, reconnects, stalled clients, the room limit per session) and which profile uploads are kept, HTTP caching headers, upload key rules and stored-file handling, the per-address connection cap and the log throttle, damaged input files, config validation (including `data_dir`), and that only the latest update's patch archive is served.
 
 ## Security
 
-The server is meant for a LAN or a group that trusts each other. Online ids come from the client and are not verified, and uploads are not authenticated: the server only accepts the key shapes the client uses (a match record only for an id it issued itself), limits their size and number, and never lets a connection from another address end a player's matchmaking session. Don't expose the ports to the internet unless you accept that players can see and change each other's uploaded profiles.
+The server is meant for your local network. Nothing a client sends proves which player it is: online ids come from the client unverified, and uploads are not authenticated. To limit what that allows, the server:
+- accepts only the upload key shapes the client uses (a match record only for an id it issued itself), and limits upload size and the number of stored files;
+- keeps a player's profile only during and just after a match with another console, and only from the address that played it under that id (see below);
+- caps the connections each address may hold open, closes HTTP connections that send nothing, and never lets a connection from another address end a player's matchmaking session;
+- lets a matchmaking session be in at most 4 rooms at once (as many as the game uses), and lists fuller rooms first in a search, rooms with as many players in random order, so rooms opened first cannot hide the others.
+
+Someone on your network who has the game and this server's code can still pose as another player. Allow the ports from your local network only, and don't forward them on your router: everything the server serves is derived from your game files.
+
+**Player profiles:** the console uploads its whole profile at sign-in, in the menus and around every match. The server keeps it only during a match with another console and for 15 seconds after the player leaves it; the other uploads are acknowledged but not kept. Changes made in the menus, or in a game played alone, are therefore kept once the player finishes a match with another console. If they sign out before that, the next sign-in loads the last profile kept.
 
 ## Open questions
 

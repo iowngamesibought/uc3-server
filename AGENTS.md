@@ -2,12 +2,17 @@
 
 You are helping someone run this server for their own copy of the game. Work through the steps below in order, and check each one before moving on. Read `README.md` first for what the server does.
 
+<!-- Shared ground rules: copied verbatim from the game-server agent-docs template. Edit them there, then copy to every project. -->
 ## Ground rules
 
 - **Use only the user's own copy of the game.** Never download game files, decrypted executables, keys or license files from the internet, and never suggest where to get them. If the user doesn't have the files, stop and tell them what's missing.
-- **Never put game-derived files in this repository**: executables, archives, generated output, decompiler projects or exports, server logs, stored uploads. Keep them in a folder outside it, or in the git-ignored `game/`, `logs/` and `storage/` folders.
-- **The host names you find in step 2 go into the user's DNS setup only.** Don't write them into this repository (code, docs, config examples, commits or issues), and don't copy anything else out of the executable: no keys, code or text. The server reads what it needs from the user's files at runtime.
-- Run commands only with the user's agreement when they change their system (firewall rules, DNS, router settings).
+- **Decrypting the executable is the user's job.** Where the server needs the executable decrypted, the user provides that form from their own copy; it is their responsibility. Don't explain how to decrypt it, and never obtain a decrypted copy elsewhere.
+- **Never put game-derived files in this repository**: executables, archives, generated output, decompiler projects or exports, server logs, stored uploads. Keep them in a folder outside it, or in the git-ignored folders this guide names.
+- **The host names you find go into the user's DNS setup only.** Don't write them into this repository (code, docs, config examples, commits or issues), and don't copy anything else out of the executable: no keys, code or text. The server reads what it needs from the user's files at runtime.
+- **Change the user's system only with their agreement**: firewall rules, DNS, router settings.
+<!-- End of shared ground rules. -->
+
+In this project the git-ignored folders for game-derived files are `game/`, `logs/` and `storage/`.
 
 ## 1. Supply the required files
 
@@ -15,14 +20,10 @@ The server needs two files from the user's own installed copy, plus one optional
 
 ### Where to look
 
-Ask the user where their copy of the game is, which platform it's for, and whether the game's latest update is installed; they can give you the folders and that context. Two places matter:
+Follow the [pick-game-files](.claude/skills/pick-game-files/SKILL.md) skill: it finds the base game and the latest update in the user's copy, disc or download, and takes the update's copy of each file over the base game's. For this game:
 
-- The **update's data folder**: the latest update installs its own main executable and its patch archives there, directly in the folder (no `build/` tree).
-- The **base game's data folder** (on the disc or in the installation): it holds an older main executable and a `build/main/` tree of archives.
-
-The server supports only the executable of the game's **latest update**: the game is no longer developed, so that update is final. If it isn't installed, the user has to install it on their console first.
-
-Copying the files off the console (or off the disc) is the user's job, like decrypting the executable below; ask them for the files once they have them on this machine.
+- Both required files come from the latest update: its executable and one of its patch archives. The base game supplies at most the optional text archive, so a copy without the update won't work.
+- The server refuses an executable or a patch archive from any other build at startup. It knows the executable of one edition's update; another edition or region may be a different build (see the startup check below).
 
 Copy the files into a `game/` folder next to the user's `uc3-server.toml` (git-ignored in this project), keeping their original names, and set the keys to `game/<file name>`. Absolute paths elsewhere work too. Never place them anywhere that gets committed.
 
@@ -30,11 +31,11 @@ Copy the files into a `game/` folder next to the user's `uc3-server.toml` (git-i
 
 | Config key | How to recognise it |
 |---|---|
-| `executable` | The **update's main boot executable**: the one file directly in the update's data folder with a `.BIN` extension, about 18.8 MB. As installed it is **encrypted** (it does not start with `\x7fELF`). The server needs it **decrypted** to an ELF: starts with `\x7fELF`, then bytes `02 02` (64-bit, big-endian). The user must provide that decrypted form from their own copy; it is their responsibility. Don't explain how to decrypt it, and never obtain a decrypted copy elsewhere. The base game's executable (also `.BIN`, slightly smaller) is an older build and won't work. |
+| `executable` | The **update's main boot executable**: the one file directly in the update's data folder with a `.BIN` extension, about 18.8 MB. As installed it is **encrypted** (it does not start with `\x7fELF`). The server needs it **decrypted** to an ELF: starts with `\x7fELF`, then bytes `02 02` (64-bit, big-endian). See the ground rules. In a disc copy, the base game's executable (also `.BIN`, slightly smaller) is an older build and won't work. |
 | `patch_archive` | One of the update's **patch archives**, directly in the update's data folder, a few hundred MB, in the game's own archive format. Its entries are full paths starting with `build/main/`. The update has two of them; the right one holds the online config module (entries ending in `dc1/net.bin` and the update's own `dc1/net-patch<N>.bin`) and the per-language online texts (`build/main/text1/<n>.networking`). It is the larger of the two, with the higher number in its name. |
 | `text_archive` (optional) | The base game's **text archive** in its `build/main/` folder, about 5 MB. Its entries are per-language text tables named `<number>.<category>` (e.g. `2.common`), including `<number>.networking` for each language. Usually not needed: the latest update's patch archive already has the online texts of every language. Adding it does no harm. |
 
-The base game's folders hold other archives too, including very large ones (hundreds of MB to GB) with map and character data, and another patch archive that came with the game's edition. None of those is right.
+The base game's folders hold other archives too, including very large ones (hundreds of MB to GB) with map and character data, and in some editions a patch archive that came with the edition, directly in the base game's data folder. None of those is right. Several of them, like the update's smaller patch archive, hold an older online config module: the server refuses them, and `list-archive` reports `fits neither`.
 
 ### Check each candidate with the server itself
 
@@ -48,7 +49,7 @@ The base game's folders hold other archives too, including very large ones (hund
    - `cipher keys found build=1.19` and `frame key found build=1.19`. Errors and what they mean:
      - **"not a big-endian ELF64"**: the executable is still encrypted, or it's the wrong file.
      - **"N known key locations match"** or **"the frame key location of no supported build"**: it's not the main executable of the game's latest update. Usually it is the base game's older one, or one from a copy without the latest update. If the user is sure it comes from the latest update, stop and report it: the server only knows the key locations of the update build it was tested with, and supporting another build needs a code change.
-   - `online config module found entry=... servers=26`. A **"not the patch data archive"** error means `patch_archive` points at the wrong archive.
+   - `online config module found entry=... servers=26`. A **"not the latest update's patch data archive"** error means `patch_archive` points at another archive: the update's smaller one, the base game's, or one that came with the edition. Run `list-archive` on the candidates.
    - `EULA pages served by this server`, `level download list served empty` and `matchmaking playlists ...`.
    - `online config ready (in memory)`, then `networking texts ready indexes=...` listing language indexes. A **"no <n>.networking text found"** warning means neither archive has the online texts.
    - `live-data HTTP listening`, `framed services listening` (three ports), `location service listening` and `matchmaking listening`. A bind error usually means a port is in use (e.g. port 80 by IIS) or another server instance is running.
@@ -89,39 +90,33 @@ Pipe the output into `grep`/`findstr` rather than saving it, or save it outside 
 
 ## 3. Set up the DNS override
 
-Map the names to `public_host` on a DNS server the console uses. For dnsmasq:
-```
-address=/<config host>/<public_host>
-address=/<upload host>/<public_host>
-address=/<content host>/<public_host>
-```
+Follow the [dns-override](.claude/skills/dns-override/SKILL.md) skill to point the names from step 2 at `public_host`. For this game:
 
-dnsmasq's `address=` also matches every subdomain of the name. So the upload-host line on its own already sends every bucket of the storage provider to the server, the config host included. That is fine on a DNS server only the console uses, and it is why the next point matters.
-
-The upload host is the storage provider's main domain, which many other devices and services rely on. **Override it for the console only.** The simplest way: run a small DNS forwarder just for the console (e.g. dnsmasq on the server machine, with the lines above and the normal upstream resolver for everything else), and set the console's DNS server manually to it in its network settings. Changing the router's DNS for the whole network would cut every other device off from that provider. The config host can be overridden network-wide if that's easier.
-
-**Proxies:** if a proxy or TUN (fake-IP) sits between the console and the internet, add the names to its fake-IP filter and route them DIRECT. Otherwise the proxy answers with its own addresses and the console never reaches the server.
+- Override the config host and the upload host; the content host is optional and harmless.
+- The **upload host** is the storage provider's main domain, which many other devices and services rely on: override it **for the console only**. Overriding it also catches every bucket under it, the config host included.
+- The config host and the content host are used only by this game and can be overridden network-wide.
 
 **Check:**
 1. `nslookup <config host> <console's DNS server>` must return `public_host`; the same for the upload host. Query the console's DNS server explicitly: the machine you run the check on may use a different resolver.
-2. Allow inbound TCP 80, 6300–6303 and 5203 on the server machine.
+2. Allow inbound TCP 80, 6300–6303 and 5203 on the server machine, from the local network only. Don't forward these ports on the router: everything the server serves is derived from the user's game files.
 3. Start the game's online mode. The server log (`RUST_LOG=debug` for more detail) should show, in order:
    - `http method=GET host=<config host> path=/<name>.bin.psarc.crypt status=200`: twice a few milliseconds apart when the console downloads a changed config, once when its cached copy is current;
    - `login ticket ... online_id=<the user's online id>` and `matchmaking client connected`;
    - `GET .../build/main/text1/<n>.networking.crypt 200`;
    - `GET /eula/page-<n>.png 200` when the console shows the terms pages;
    - `GET .../profiles/<id>/profile.86` (404 the first time is normal), `ban check: not banned`, `heartbeat`;
-   - `stored upload key=profiles/<id>/profile.86` with `http method=PUT host=<upload host>`: this confirms the upload host.
+   - `http method=PUT host=<upload host> path=/profiles/<id>/profile.86 status=200`, after `profile upload not kept`: this confirms the upload host. Profiles are kept only during and just after a match with another console (README, Security). After one, the log shows `room played` and `stored upload key=profiles/<id>/profile.86`.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| No request reaches the server | DNS still resolves the config host elsewhere (check against the console's DNS server), a proxy intercepts it, or the firewall blocks port 80. If the first config download fails, the console retries against an old built-in address that DNS can't redirect, so the online start then fails after a long wait. |
+| No request reaches the server | Follow "No request reaches the server" in the [dns-override](.claude/skills/dns-override/SKILL.md) skill, with the config host and port 80. If the first config download fails, the console retries against an old built-in address that DNS can't redirect, so the online start then fails after a long wait. |
 | Config downloaded, but no `login ticket` line | `public_host` isn't reachable from the console, or TCP 6300 is blocked |
 | "Failed to initialize session manager" right after sign-in | TCP 6303 is blocked, or the matchmaking port failed to bind (see the startup log) |
 | The terms pages fail to load | They come straight from `public_host` on the HTTP port, without DNS: check that the console can reach it |
 | "Error syncing text" | The text for the console's language index wasn't served: add `text_archive` and check the `networking texts ready` log line |
-| No `PUT` or `stored upload` lines; player progress isn't kept between sessions | The upload host isn't overridden for the console |
+| No `PUT` lines; player progress isn't kept between sessions | The upload host isn't overridden for the console |
+| `profile upload not kept`; changes made in the menus are gone at the next sign-in | Expected: profiles are kept only during and just after a match with another console (README, Security). If it also happens after such a match, look for `room played`: the consoles must reach the server from different addresses |
 | Two consoles that start Find Game at the same moment each host their own lobby | Both searched before either lobby existed. Start the second console a few seconds later |
 | Only one config `GET` per start, and config changes have no effect | The console's cached copy is considered current. Any change to the served config changes its date and forces a download at the next sign-in; check that the server was restarted after the config change |

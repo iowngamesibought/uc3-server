@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
+use crate::listen::Listener;
+
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Location {
@@ -45,9 +47,11 @@ pub async fn serve(bind: SocketAddr, loc: Location) -> Result<()> {
         .await
         .with_context(|| format!("binding location port {bind}"))?;
     info!(%bind, "location service listening");
+    let listener = Listener::new(listener, "location");
     loop {
-        let (mut s, peer) = listener.accept().await?;
+        let (mut s, peer, slot) = listener.accept().await;
         tokio::spawn(async move {
+            let _slot = slot;
             let mut buf = [0u8; 0x100];
             let n = match tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf))
                 .await
@@ -63,32 +67,4 @@ pub async fn serve(bind: SocketAddr, loc: Location) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn answer_has_the_parsed_shape() {
-        let a = answer(Location {
-            lat: 1.5,
-            lon: -2.0,
-        });
-        let tokens: Vec<&str> = a.split([' ', '\n']).filter(|t| !t.is_empty()).collect();
-        assert_eq!(tokens, ["+", "1.5", "-2", "0", "0", "0"]);
-        assert!(a.len() < 0x100);
-    }
-
-    #[test]
-    fn default_is_not_the_unknown_value() {
-        assert!(Location::default().check().is_ok());
-        assert!(Location { lat: 0.0, lon: 0.0 }.check().is_err());
-        assert!(
-            Location {
-                lat: -0.0,
-                lon: 0.0
-            }
-            .check()
-            .is_err()
-        );
-        assert!(Location { lat: 0.0, lon: 2.0 }.check().is_ok());
-    }
-}
+mod tests;

@@ -27,6 +27,8 @@
 //!   * When the owner leaves, the best-ranked remaining member of the owner's last HostRank takes
 //!     over, else the longest-standing member; an empty room is removed. Rooms hold at most 10
 //!     members (the client's member slots).
+//!   * A session is in at most 4 rooms at once (the client's room objects). A create or join
+//!     beyond that is refused; a real client never sends one.
 //!
 //! Matching (as observed on real consoles):
 //!   * A room matches a search when its mode (RoomCreate +0x0c / RoomSearch +0x0c) and playlist
@@ -35,6 +37,9 @@
 //!     interprets them. Seen so far: Find Game competitive, Find Game co-op, custom games (the mode
 //!     changes with the chosen game type) and the invite party each use their own pair, so they
 //!     never meet in a search.
+//!   * A search lists fuller rooms first, so players gather in one lobby, and rooms with as many
+//!     members in random order, so rooms opened first cannot keep later ones out of the 24 results
+//!     (the client's result array).
 //!   * Room flag bit 0 means "not open to searches": consoles set it at every round start and clear
 //!     it after the match, custom games set it right after creation (private), and an owner sets it
 //!     before abandoning a room. Joins ignore it: an invited player joins a custom lobby after the
@@ -50,6 +55,17 @@
 //!     The minimum comes from the online config (6 for most competitive playlists, 2 for co-op) and
 //!     can be lowered with `[playlists] min_players` (see dc::set_min_players).
 //!
+//! Profile uploads: the client uploads its whole profile at sign-in, in the menus, and around every
+//! match, and the uploads are not authenticated. The HTTP side therefore keeps a profile only when
+//! it comes from an address that has a session under that online id in a played room, or had one
+//! that left such a room less than [`UPLOAD_GRACE`] ago: a match's last uploads arrive just before
+//! or just after leaving, and after the room flag is cleared. A room is played once it is closed to
+//! searches while its members are on at least two addresses (a Find Game match started, or a
+//! custom game with a guest), and stays played. Every other profile upload is acknowledged but not
+//! kept: the next match uploads the whole profile again, so menu changes are kept once the player
+//! finishes a match with another console. Room membership is no proof of identity either (see
+//! "Trust"); this only limits when and from where a profile can be replaced.
+//!
 //! Trust: every member may set the room-wide attr and room flags (the protocol's update records
 //! carry no member id, and guests do set them: co-op round starts, a new owner closing the room).
 //! The server keeps the last value and relays it. A modified client could therefore close, reopen
@@ -57,10 +73,12 @@
 //! lobby phase, is where tracking can be hardened later. Kicks are accepted from the owner only but
 //! were never seen from a console.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -69,6 +87,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::framed::hex;
+use crate::listen::{Listener, Throttle};
 
 const CLIENT_HELLO: u32 = 0x12d;
 const SERVER_HELLO: u32 = 0x12e;
@@ -110,6 +129,9 @@ const MAX_SEARCH_RESULTS: usize = 24;
 /// signaling. Ten records also fit one RoomJoined in the client's receive buffer.
 const MAX_MEMBERS: usize = 10;
 const _: () = assert!(0xa0 + MAX_MEMBERS * MEMBER_LEN <= CLIENT_BUFFER);
+/// The client has 4 room objects and each holds one membership (see `Member::slot`), so a session
+/// never needs more rooms at once.
+const MAX_ROOMS_PER_SESSION: usize = 4;
 /// Room flag bit 0: the room is not open to searches (see "Matching" in the module docs).
 const ROOM_FLAG_CLOSED: u16 = 1;
 /// The client pings every 30 s. Three missed pings drop the connection, so a vanished console's
@@ -117,6 +139,9 @@ const ROOM_FLAG_CLOSED: u16 = 1;
 const IDLE: Duration = Duration::from_secs(90);
 /// A record not written within this time means the client stopped reading: the session ends.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long after leaving a played room a player's profile uploads are still kept (see "Profile
+/// uploads"). In tests on consoles the last upload came within 0.1 s of leaving.
+const UPLOAD_GRACE: Duration = Duration::from_secs(15);
 
 /// Size of a client record by type; HostRank's length comes from its count field.
 fn request_len(kind: u32) -> Option<usize> {
@@ -256,6 +281,9 @@ struct Room {
     members: Vec<Member>,
     /// The owner's latest HostRank: member ids, best host first. Used to pick the next owner.
     host_rank: Vec<u16>,
+    /// Closed to searches at some point while its members were on at least two addresses (see
+    /// "Profile uploads").
+    played: bool,
 }
 
 impl Room {
@@ -344,6 +372,9 @@ struct Lobby {
     next_room: u64,
     clients: HashMap<ClientId, Client>,
     rooms: HashMap<u64, Room>,
+    /// (online id, address) that left a played room, and until when their profile uploads are
+    /// kept. Expired entries are dropped whenever one is added.
+    upload_permits: HashMap<(String, IpAddr), Instant>,
 }
 
 impl Lobby {
@@ -412,6 +443,7 @@ impl Lobby {
         }
         room.host_rank.retain(|id| *id != gone.id);
         let empty = room.members.is_empty();
+        let played = room.played;
         info!(
             room = room_id,
             member = gone.id,
@@ -419,6 +451,9 @@ impl Lobby {
             remaining = others.len(),
             "member left"
         );
+        if played {
+            self.permit_uploads(client);
+        }
         if kicked {
             self.send(&[client], &Rec::new(KICKEDOUT, 0x10).u64(8, room_id).done());
         }
@@ -443,10 +478,50 @@ impl Lobby {
             info!(room = room_id, "room closed");
         }
     }
+
+    /// Marks a room played once it is closed to searches while its members are on at least two
+    /// addresses (see "Profile uploads").
+    fn check_played(&mut self, room_id: u64) {
+        let Some(room) = self.rooms.get(&room_id) else {
+            return;
+        };
+        if room.played || room.room_flags & ROOM_FLAG_CLOSED == 0 {
+            return;
+        }
+        let addresses: HashSet<IpAddr> = room
+            .members
+            .iter()
+            .filter_map(|m| self.clients.get(&m.client).map(|c| c.ip))
+            .collect();
+        if addresses.len() < 2 {
+            return;
+        }
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            room.played = true;
+            info!(
+                room = room_id,
+                members = room.members.len(),
+                "room played: its members' profile uploads are kept"
+            );
+        }
+    }
+
+    /// Keeps `client`'s profile uploads for UPLOAD_GRACE after it left a played room.
+    fn permit_uploads(&mut self, client: ClientId) {
+        let Some(c) = self.clients.get(&client) else {
+            return;
+        };
+        let now = Instant::now();
+        self.upload_permits.retain(|_, until| *until > now);
+        self.upload_permits
+            .insert((c.name.clone(), c.ip), now + UPLOAD_GRACE);
+    }
 }
 
 pub struct Matchmaking {
     lobby: Mutex<Lobby>,
+    /// Matchmaking needs no key, so anyone can trigger its warnings: they are throttled.
+    warnings: Throttle,
 }
 
 impl Matchmaking {
@@ -456,7 +531,52 @@ impl Matchmaking {
                 next_room: 1,
                 ..Default::default()
             }),
+            warnings: Throttle::default(),
         }
+    }
+
+    /// Whether a profile upload for `online_id` from `ip` is kept (see "Profile uploads"): the
+    /// address has a session under that id in a played room, or one that left such a room less
+    /// than UPLOAD_GRACE ago.
+    pub fn keeps_profile(&self, online_id: &str, ip: IpAddr) -> bool {
+        let l = self.lobby();
+        let is_uploader = |client: &ClientId| {
+            l.clients
+                .get(client)
+                .is_some_and(|c| c.name == online_id && c.ip == ip)
+        };
+        let playing = l
+            .rooms
+            .values()
+            .filter(|r| r.played)
+            .any(|r| r.members.iter().any(|m| is_uploader(&m.client)));
+        playing
+            || l.upload_permits
+                .get(&(online_id.to_string(), ip))
+                .is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Keeps `online_id`'s profile uploads from `ip` for UPLOAD_GRACE, as if it had just left a
+    /// played room.
+    #[cfg(test)]
+    pub(crate) fn permit_uploads_for_test(&self, online_id: &str, ip: IpAddr) {
+        self.lobby()
+            .upload_permits
+            .insert((online_id.to_string(), ip), Instant::now() + UPLOAD_GRACE);
+    }
+
+    /// Whether `client` already holds MAX_ROOMS_PER_SESSION rooms, checked after a create or join
+    /// ended the membership of the room object it reuses. If so, the request is refused: room id 0
+    /// in RoomJoined tells the client it failed.
+    fn at_room_limit(&self, l: &Lobby, client: ClientId, who: &str, ptr: u32) -> bool {
+        if l.rooms_of(client).len() < MAX_ROOMS_PER_SESSION {
+            return false;
+        }
+        if let Some(suppressed) = self.warnings.allow() {
+            warn!(%who, suppressed, "room refused: the session is already in {MAX_ROOMS_PER_SESSION} rooms");
+        }
+        l.send(&[client], &Rec::new(ROOM_JOINED, 0xa0).u32(8, ptr).done());
+        true
     }
 
     /// The lobby state. A panic in a handler must not take matchmaking down for everyone, so a
@@ -485,8 +605,10 @@ impl Matchmaking {
             .filter(|(_, c)| c.name == name)
             .map(|(id, c)| (*id, c.ip == ip))
             .collect();
-        if same.iter().any(|(_, same_ip)| !same_ip) {
-            warn!(online_id = %name, %ip, "online id already connected from another address; keeping both sessions");
+        if same.iter().any(|(_, same_ip)| !same_ip)
+            && let Some(suppressed) = self.warnings.allow()
+        {
+            warn!(online_id = %name, %ip, suppressed, "online id already connected from another address; keeping both sessions");
         }
         let stale = same
             .into_iter()
@@ -533,6 +655,9 @@ impl Matchmaking {
             ROOM_CREATE => {
                 let slot = be32(rec, 8);
                 l.leave_slot(client, slot);
+                if self.at_room_limit(&l, client, &who, slot) {
+                    return;
+                }
                 let id = l.next_room;
                 l.next_room += 1;
                 let data_len = rec[0x26].min(DATA_LEN as u8);
@@ -548,6 +673,7 @@ impl Matchmaking {
                     next_member: 2,
                     members: Vec::new(),
                     host_rank: Vec::new(),
+                    played: false,
                 };
                 room.members.push(Member {
                     id: 1,
@@ -569,6 +695,9 @@ impl Matchmaking {
                 let ptr = be32(rec, 8);
                 let data_len = rec[0xc].min(DATA_LEN as u8);
                 l.leave_slot(client, ptr);
+                if self.at_room_limit(&l, client, &who, ptr) {
+                    return;
+                }
                 let joined = l.rooms.get_mut(&room_id).and_then(|room| {
                     if room.member_by_client(client).is_some()
                         || room.members.len() >= room.max as usize
@@ -601,6 +730,8 @@ impl Matchmaking {
                         info!(%who, room = room_id, member, "joined room");
                         l.send(&[client], &reply);
                         l.send(&others, &note);
+                        // A guest joining a private custom game makes it a match.
+                        l.check_played(room_id);
                     }
                     None => {
                         info!(%who, room = room_id, "join refused (no such room, full, or already in it)");
@@ -619,7 +750,9 @@ impl Matchmaking {
                     .filter(|r| r.matches_search(mode, playlist))
                     .filter(|r| r.member_by_client(client).is_none())
                     .collect();
-                rooms.sort_by_key(|r| r.id);
+                // Fuller rooms first, ties in random order (see "Matching").
+                let ties = RandomState::new();
+                rooms.sort_by_cached_key(|r| (Reverse(r.members.len()), ties.hash_one(r.id)));
                 rooms.truncate(MAX_SEARCH_RESULTS);
                 let mut r = Rec::new(ROOM_SEARCH_RESULT, 0x10 + rooms.len() * SEARCH_ENTRY_LEN);
                 r.u32(8, be32(rec, 8)).u32(0xc, rooms.len() as u32);
@@ -641,7 +774,9 @@ impl Matchmaking {
                 match victim {
                     Some(v) if v != client => l.leave(room_id, v, true),
                     _ => {
-                        warn!(%who, room = room_id, target, "kick ignored (not the owner or no such member)")
+                        if let Some(suppressed) = self.warnings.allow() {
+                            warn!(%who, room = room_id, target, suppressed, "kick ignored (not the owner or no such member)")
+                        }
                     }
                 }
             }
@@ -677,7 +812,9 @@ impl Matchmaking {
                     PROMOTE => {
                         let target = be16(rec, 4);
                         if me != room.owner || !room.members.iter().any(|m| m.id == target) {
-                            warn!(%who, room = room_id, target, "promote ignored");
+                            if let Some(suppressed) = self.warnings.allow() {
+                                warn!(%who, room = room_id, target, suppressed, "promote ignored");
+                            }
                             return;
                         }
                         room.owner = target;
@@ -718,6 +855,9 @@ impl Matchmaking {
                     room.others(client)
                 };
                 l.send(&to, &note);
+                if kind == SET_ROOM_FLAGS {
+                    l.check_played(room_id);
+                }
             }
             HOST_RANK => {
                 let room_id = be64(rec, 8);
@@ -739,7 +879,11 @@ impl Matchmaking {
             }
             PING => {}
             CLIENT_HELLO2 => debug!(%who, proof = %hex(&rec[4..8]), "client hello 2"),
-            _ => warn!(%who, kind = format!("{kind:#x}"), raw = %hex(rec), "unexpected record"),
+            _ => {
+                if let Some(suppressed) = self.warnings.allow() {
+                    warn!(%who, kind = format!("{kind:#x}"), raw = %hex(rec), suppressed, "unexpected record")
+                }
+            }
         }
     }
 }
@@ -749,10 +893,12 @@ pub async fn serve(bind: SocketAddr, mm: Arc<Matchmaking>) -> Result<()> {
         .await
         .with_context(|| format!("binding matchmaking port {bind}"))?;
     info!(%bind, "matchmaking listening");
+    let listener = Listener::new(listener, "matchmaking");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer, slot) = listener.accept().await;
         let mm = mm.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = connection(stream, peer, &mm).await {
                 debug!(%peer, "matchmaking connection ended: {e:#}");
             }
@@ -859,463 +1005,4 @@ fn rand_u32() -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn player_id(name: &str) -> [u8; PLAYER_ID_LEN] {
-        let mut n = [0u8; PLAYER_ID_LEN];
-        n[..name.len()].copy_from_slice(name.as_bytes());
-        n
-    }
-
-    const LAN: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-
-    fn client(mm: &Matchmaking, name: &str) -> (ClientId, mpsc::UnboundedReceiver<Vec<u8>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (mm.connect(name.into(), LAN, tx).0, rx)
-    }
-
-    fn create(ptr: u32, max: u16) -> Vec<u8> {
-        Rec::new(ROOM_CREATE, 0xe8)
-            .u32(8, ptr)
-            .u32(0xc, 7)
-            .u32(0x14, 3)
-            .u16(0x24, max)
-            .u8(0x26, 4)
-            .bytes(0x28, b"room")
-            .bytes(0xa8, b"DATA")
-            .done()
-    }
-
-    fn join(ptr: u32, room: u64) -> Vec<u8> {
-        Rec::new(ROOM_JOIN, 0x58)
-            .u32(8, ptr)
-            .u8(0xc, 2)
-            .u64(0x10, room)
-            .bytes(0x18, b"JD")
-            .done()
-    }
-
-    /// Creates a room for `name` and returns its id (consuming the RoomJoined).
-    fn host(
-        mm: &Matchmaking,
-        c: ClientId,
-        rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-        name: &str,
-        ptr: u32,
-        max: u16,
-    ) -> u64 {
-        mm.handle(c, &player_id(name), &create(ptr, max));
-        be64(&rx.try_recv().unwrap(), 0x10)
-    }
-
-    fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Vec<u8>> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
-    }
-
-    fn rooms(mm: &Matchmaking) -> usize {
-        mm.lobby().rooms.len()
-    }
-
-    #[test]
-    fn reusing_a_room_object_ends_its_previous_membership() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, mut rb) = client(&mm, "bob");
-        let room = host(&mm, a, &mut ra, "alice", 0x100, 4);
-        mm.handle(b, &player_id("bob"), &join(0x200, room));
-        drain(&mut ra);
-        drain(&mut rb);
-        // Bob's client resets room object 0x200 locally and creates a room with it: no RoomLeave.
-        mm.handle(b, &player_id("bob"), &create(0x200, 4));
-        let left = drain(&mut ra);
-        assert!(
-            left.iter()
-                .any(|r| be32(r, 0) == ROOM_LEFT && be16(r, 0x10) == 2),
-            "alice is told bob left"
-        );
-        assert_eq!(rooms(&mm), 2);
-        assert_eq!(mm.lobby().rooms[&room].members.len(), 1);
-        // A different room object keeps its membership: Alice creates a second room with 0x101.
-        mm.handle(a, &player_id("alice"), &create(0x101, 4));
-        assert_eq!(mm.lobby().rooms[&room].members.len(), 1);
-        assert_eq!(rooms(&mm), 3);
-    }
-
-    #[test]
-    fn a_reconnect_replaces_the_old_session() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, mut rb) = client(&mm, "bob");
-        let room = host(&mm, a, &mut ra, "alice", 0x100, 4);
-        mm.handle(b, &player_id("bob"), &join(0x200, room));
-        drain(&mut ra);
-        // Bob's console reconnects before the old connection timed out.
-        let (tx, _rb2) = mpsc::unbounded_channel();
-        let (b2, _) = mm.connect("bob".into(), LAN, tx);
-        assert_ne!(b, b2);
-        assert!(
-            drain(&mut ra).iter().any(|r| be32(r, 0) == ROOM_LEFT),
-            "alice sees the old session leave"
-        );
-        assert!(!mm.lobby().clients.contains_key(&b));
-        // The old connection's queue is closed and its late records are ignored.
-        drain(&mut rb);
-        assert!(matches!(
-            rb.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
-        mm.handle(b, &player_id("bob"), &join(0x200, room));
-        assert_eq!(mm.lobby().rooms[&room].members.len(), 1);
-    }
-
-    /// A connection claiming a connected player's id from another address does not end that
-    /// player's session or memberships.
-    #[test]
-    fn the_same_id_from_another_address_does_not_replace_a_session() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, _rb) = client(&mm, "bob");
-        let room = host(&mm, a, &mut ra, "alice", 0x100, 4);
-        mm.handle(b, &player_id("bob"), &join(0x200, room));
-        drain(&mut ra);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let other: IpAddr = "192.168.1.99".parse().unwrap();
-        let (b2, _) = mm.connect("bob".into(), other, tx);
-        assert_ne!(b, b2);
-        assert!(mm.lobby().clients.contains_key(&b) && mm.lobby().clients.contains_key(&b2));
-        assert_eq!(mm.lobby().rooms[&room].members.len(), 2);
-        assert!(drain(&mut ra).is_empty(), "alice sees no change");
-    }
-
-    #[test]
-    fn the_owner_s_host_rank_picks_the_next_owner() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, mut rb) = client(&mm, "bob");
-        let (c, mut rc) = client(&mm, "carol");
-        let room = host(&mm, a, &mut ra, "alice", 1, 4);
-        mm.handle(b, &player_id("bob"), &join(2, room));
-        mm.handle(c, &player_id("carol"), &join(3, room));
-        // Alice ranks Carol (3) before Bob (2); a ranking from a non-owner is ignored.
-        let rank = |ids: &[u16]| {
-            let mut r = Rec::new(HOST_RANK, 0x10 + 2 * ids.len());
-            r.u16(4, ids.len() as u16).u64(8, room);
-            for (i, id) in ids.iter().enumerate() {
-                r.u16(0x10 + 2 * i, *id);
-            }
-            r.done()
-        };
-        mm.handle(a, &player_id("alice"), &rank(&[3, 2]));
-        mm.handle(b, &player_id("bob"), &rank(&[2, 3]));
-        drain(&mut rb);
-        drain(&mut rc);
-        mm.disconnect(a);
-        let to_bob = drain(&mut rb);
-        let owner = to_bob
-            .iter()
-            .find(|r| be32(r, 0) == OWNER_CHANGED)
-            .expect("owner change sent");
-        assert_eq!(be16(owner, 4), 3);
-        assert_eq!(mm.lobby().rooms[&room].owner, 3);
-    }
-
-    #[test]
-    fn member_ids_skip_ids_in_use_after_wrapping() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, _rb) = client(&mm, "bob");
-        let room = host(&mm, a, &mut ra, "alice", 1, 4);
-        mm.lobby().rooms.get_mut(&room).unwrap().next_member = 1; // as if the counter wrapped
-        mm.handle(b, &player_id("bob"), &join(2, room));
-        let ids: Vec<u16> = mm.lobby().rooms[&room]
-            .members
-            .iter()
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(ids, [1, 2]);
-    }
-
-    /// A second connection of the same player closes the first one's session.
-    #[tokio::test]
-    async fn a_reconnect_closes_the_old_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mm = Arc::new(Matchmaking::new());
-        let first = {
-            let (mm, listener) = (mm.clone(), listener);
-            tokio::spawn(async move {
-                let (s, peer) = listener.accept().await.unwrap();
-                let r = connection(s, peer, &mm).await;
-                (r, listener)
-            })
-        };
-        let hello = Rec::new(CLIENT_HELLO, 0x30)
-            .bytes(8, &player_id("tester"))
-            .done();
-        let mut sh = [0u8; 0x10];
-        let mut s1 = TcpStream::connect(addr).await.unwrap();
-        s1.write_all(&hello).await.unwrap();
-        s1.read_exact(&mut sh).await.unwrap();
-        // The first session is registered before its ServerHello is sent; connect the second directly.
-        let (tx, _rx) = mpsc::unbounded_channel();
-        mm.connect("tester".into(), LAN, tx);
-        let (ended, _listener) = tokio::time::timeout(Duration::from_secs(5), first)
-            .await
-            .expect("old session ended")
-            .unwrap();
-        assert!(ended.unwrap_err().to_string().contains("replaced"));
-        assert_eq!(mm.lobby().clients.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_stalled_record_ends_the_session_and_its_rooms() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mm = Arc::new(Matchmaking::new());
-        let server = {
-            let mm = mm.clone();
-            tokio::spawn(async move {
-                let (s, peer) = listener.accept().await.unwrap();
-                connection_with(s, peer, &mm, Duration::from_millis(300)).await
-            })
-        };
-        let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(
-            &Rec::new(CLIENT_HELLO, 0x30)
-                .bytes(8, &player_id("tester"))
-                .done(),
-        )
-        .await
-        .unwrap();
-        let mut sh = [0u8; 0x10];
-        s.read_exact(&mut sh).await.unwrap();
-        s.write_all(&create(5, 4)).await.unwrap();
-        let mut joined = [0u8; 0xa0 + MEMBER_LEN];
-        s.read_exact(&mut joined).await.unwrap();
-        assert_eq!(rooms(&mm), 1);
-        // Half a record, then silence: the session must end and the room must go.
-        s.write_all(&create(6, 4)[..20]).await.unwrap();
-        let ended = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("session ended")
-            .unwrap();
-        assert!(ended.is_err());
-        assert_eq!(rooms(&mm), 0);
-        assert!(mm.lobby().clients.is_empty());
-    }
-
-    #[test]
-    fn records_have_the_client_sizes() {
-        for (kind, len) in [
-            (CLIENT_HELLO, 0x30),
-            (ROOM_CREATE, 0xe8),
-            (ROOM_JOIN, 0x58),
-            (ROOM_SEARCH, 0x24),
-            (MEMBER_SET_DATA, 0x50),
-            (SET_ROOM_NAME, 0x90),
-            (PING, 4),
-            (CLIENT_HELLO2, 8),
-        ] {
-            assert_eq!(request_len(kind), Some(len));
-        }
-        assert_eq!(
-            request_len(ROOM_JOINED),
-            None,
-            "server-only types are not accepted from clients"
-        );
-    }
-
-    #[test]
-    fn create_search_join_leave() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, mut rb) = client(&mm, "bob");
-        mm.handle(a, &player_id("alice"), &create(0x1000, 2));
-        let joined = ra.try_recv().unwrap();
-        assert_eq!(
-            (
-                be32(&joined, 0),
-                be32(&joined, 8),
-                be16(&joined, 0xc),
-                be16(&joined, 0xe)
-            ),
-            (ROOM_JOINED, 0x1000, 1, 1)
-        );
-        let room = be64(&joined, 0x10);
-        assert!(room != 0);
-        assert_eq!(
-            (be16(&joined, 0x18), be16(&joined, 0x1a), joined.len()),
-            (2, 1, 0xa0 + MEMBER_LEN)
-        );
-        assert_eq!(&joined[0xa0..0xa5], b"alice");
-        assert_eq!(&joined[0xa0 + 0x28..0xa0 + 0x2c], b"DATA");
-
-        let search = Rec::new(ROOM_SEARCH, 0x24)
-            .u32(8, 0x2000)
-            .u32(0xc, 7)
-            .u32(0x10, 3)
-            .done();
-        mm.handle(b, &player_id("bob"), &search);
-        let res = rb.try_recv().unwrap();
-        assert_eq!(
-            (be32(&res, 0), be32(&res, 8), be32(&res, 0xc)),
-            (ROOM_SEARCH_RESULT, 0x2000, 1)
-        );
-        assert_eq!(be64(&res, 0x10), room);
-        assert_eq!(&res[0x10 + 0x14..0x10 + 0x19], b"alice");
-        assert_eq!((be16(&res, 0x10 + 0xc), be16(&res, 0x10 + 0x10)), (1, 2));
-
-        let join = Rec::new(ROOM_JOIN, 0x58)
-            .u32(8, 0x3000)
-            .u8(0xc, 2)
-            .u64(0x10, room)
-            .bytes(0x18, b"BD")
-            .done();
-        mm.handle(b, &player_id("bob"), &join);
-        let jb = rb.try_recv().unwrap();
-        assert_eq!(
-            (
-                be32(&jb, 0),
-                be64(&jb, 0x10),
-                be16(&jb, 0xe),
-                be16(&jb, 0x1a)
-            ),
-            (ROOM_JOINED, room, 2, 2)
-        );
-        let note = ra.try_recv().unwrap();
-        assert_eq!(
-            (be32(&note, 0), note.len(), be16(&note, 0x34), note[0x37]),
-            (MEMBER_JOINED, 0x78, 2, 2)
-        );
-        assert_eq!(&note[0x10..0x13], b"bob");
-
-        // Full now: a third player is refused with room id 0.
-        let (c, mut rc) = client(&mm, "carol");
-        mm.handle(c, &player_id("carol"), &join);
-        let jc = rc.try_recv().unwrap();
-        assert_eq!((be32(&jc, 0), be64(&jc, 0x10)), (ROOM_JOINED, 0));
-
-        // The owner leaves: bob sees RoomLeft and becomes the owner.
-        mm.disconnect(a);
-        let left = rb.try_recv().unwrap();
-        assert_eq!(
-            (be32(&left, 0), left.len(), be16(&left, 0x10)),
-            (ROOM_LEFT, 0x18, 1)
-        );
-        let owner = rb.try_recv().unwrap();
-        assert_eq!((be32(&owner, 0), be16(&owner, 4)), (OWNER_CHANGED, 2));
-        mm.handle(
-            b,
-            &player_id("bob"),
-            &Rec::new(ROOM_LEAVE, 0x10).u64(8, room).done(),
-        );
-        assert!(mm.lobby.lock().unwrap().rooms.is_empty());
-    }
-
-    #[test]
-    fn search_only_finds_matching_rooms() {
-        let mm = Matchmaking::new();
-        let (a, _ra) = client(&mm, "alice");
-        let (b, mut rb) = client(&mm, "bob");
-        mm.handle(a, &player_id("alice"), &create(1, 4));
-        mm.handle(
-            b,
-            &player_id("bob"),
-            &Rec::new(ROOM_SEARCH, 0x24).u32(0xc, 7).u32(0x10, 99).done(),
-        );
-        assert_eq!(be32(&rb.try_recv().unwrap(), 0xc), 0);
-    }
-
-    /// Room flag bit 0 hides a room from searches (a match in progress, a private custom game) but
-    /// does not stop joins (invites into a custom lobby arrive after the flag is set).
-    #[test]
-    fn closed_rooms_are_hidden_from_searches_but_joinable() {
-        let mm = Matchmaking::new();
-        let (a, mut ra) = client(&mm, "alice");
-        let (b, mut rb) = client(&mm, "bob");
-        mm.handle(a, &player_id("alice"), &create(0x1000, 4));
-        let room = be64(&ra.try_recv().unwrap(), 0x10);
-        let flags = |v: u16| Rec::new(SET_ROOM_FLAGS, 0x10).u16(4, v).u64(8, room).done();
-        let search = Rec::new(ROOM_SEARCH, 0x24).u32(0xc, 7).u32(0x10, 3).done();
-
-        mm.handle(a, &player_id("alice"), &flags(1));
-        mm.handle(b, &player_id("bob"), &search);
-        assert_eq!(
-            be32(&rb.try_recv().unwrap(), 0xc),
-            0,
-            "closed room offered to a search"
-        );
-
-        mm.handle(b, &player_id("bob"), &join(0x3000, room));
-        let jb = rb.try_recv().unwrap();
-        assert_eq!(
-            (be32(&jb, 0), be64(&jb, 0x10)),
-            (ROOM_JOINED, room),
-            "join into a closed room refused"
-        );
-
-        let (c, mut rc) = client(&mm, "carol");
-        mm.handle(a, &player_id("alice"), &flags(0));
-        mm.handle(c, &player_id("carol"), &search);
-        let found = rc.try_recv().unwrap();
-        assert_eq!(
-            (be32(&found, 0xc), be64(&found, 0x10)),
-            (1, room),
-            "reopened room not offered"
-        );
-    }
-
-    #[test]
-    fn search_answers_fit_the_clients_result_array() {
-        let mm = Matchmaking::new();
-        let mut hosts = Vec::new();
-        for i in 0..MAX_SEARCH_RESULTS + 3 {
-            let name = format!("host{i}");
-            let (h, rh) = client(&mm, &name);
-            mm.handle(h, &player_id(&name), &create(1, 4));
-            hosts.push(rh);
-        }
-        let (b, mut rb) = client(&mm, "bob");
-        mm.handle(
-            b,
-            &player_id("bob"),
-            &Rec::new(ROOM_SEARCH, 0x24).u32(0xc, 7).u32(0x10, 3).done(),
-        );
-        let res = rb.try_recv().unwrap();
-        assert_eq!(
-            (be32(&res, 0xc), res.len()),
-            (24, 0x10 + 24 * SEARCH_ENTRY_LEN)
-        );
-    }
-
-    #[tokio::test]
-    async fn handshake_over_tcp() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mm = Arc::new(Matchmaking::new());
-        tokio::spawn(async move {
-            let (s, peer) = listener.accept().await.unwrap();
-            let _ = connection(s, peer, &mm).await;
-        });
-        let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(
-            &Rec::new(CLIENT_HELLO, 0x30)
-                .bytes(8, &player_id("tester"))
-                .done(),
-        )
-        .await
-        .unwrap();
-        let mut sh = [0u8; 0x10];
-        s.read_exact(&mut sh).await.unwrap();
-        assert_eq!(be32(&sh, 0), SERVER_HELLO);
-        s.write_all(&Rec::new(CLIENT_HELLO2, 8).done())
-            .await
-            .unwrap();
-        s.write_all(&Rec::new(PING, 4).done()).await.unwrap();
-        s.write_all(&create(5, 4)).await.unwrap();
-        let mut head = [0u8; 0xa0];
-        s.read_exact(&mut head).await.unwrap();
-        assert_eq!((be32(&head, 0), be32(&head, 8)), (ROOM_JOINED, 5));
-    }
-}
+mod tests;

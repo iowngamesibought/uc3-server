@@ -3,17 +3,20 @@
 # This machine's LAN address as the console sees it, e.g. 192.168.1.50.
 public_host = "CHANGE-ME"
 
-# Your own game files (AGENTS.md explains how to find them).
+# Your own game files, from the game's latest update (AGENTS.md explains how to find them).
 executable    = "game/<main executable, decrypted>"
 patch_archive = "game/<patch data archive>"
 # Optional: the base game's text archive, for languages the patch archive lacks.
 # text_archive = "game/<text archive>"
 
 # Optional: a folder of extra static files to serve as is. Generated files take precedence.
+# Everything in it is served to anyone who can reach the HTTP port, so the server refuses to start
+# if it holds the game files above.
 # data_dir = "static"
 
 # Where player uploads are kept: profiles (profiles/<online id>/...) and hosted-game records
 # (games/<id>). Uploads reach this server only through their own DNS override (see AGENTS.md).
+# Profiles are kept only during and just after a match with another console (see README.md).
 # storage_dir = "storage"
 
 # Address the service ports (6300-6303, 5203) bind on.

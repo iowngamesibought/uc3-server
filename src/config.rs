@@ -104,44 +104,37 @@ impl Config {
                 *p = Some(base.join(rel));
             }
         }
+        cfg.check_data_dir()?;
         Ok(cfg)
+    }
+
+    /// Everything in data_dir is served to anyone who can reach the HTTP port, so it must not hold
+    /// the game files (above all the decrypted executable). Checked on the resolved real paths.
+    fn check_data_dir(&self) -> Result<()> {
+        let Some(configured) = self.data_dir.as_deref() else {
+            return Ok(());
+        };
+        let Ok(dir) = std::fs::canonicalize(configured) else {
+            return Ok(());
+        };
+        let files = [
+            Some(&self.executable),
+            Some(&self.patch_archive),
+            self.text_archive.as_ref(),
+        ];
+        for file in files.into_iter().flatten() {
+            if std::fs::canonicalize(file).is_ok_and(|f| f.starts_with(&dir)) {
+                anyhow::bail!(
+                    "data_dir = {}: it contains {}, and everything in data_dir is served to anyone who \
+                     can reach the HTTP port; use a folder that holds only the extra static files",
+                    configured.display(),
+                    file.display()
+                );
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn example_config_parses() {
-        let text = include_str!("../uc3-server.example.toml").replace("CHANGE-ME", "192.168.1.50");
-        let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.bind_ip, any_ip());
-        assert_eq!((cfg.location.lat, cfg.location.lon), (1.0, 1.0));
-        assert!(cfg.text_archive.is_none() && cfg.data_dir.is_none());
-        assert!(cfg.playlists.min_players.is_empty());
-    }
-
-    #[test]
-    fn playlist_minimums_parse() {
-        let text = include_str!("../uc3-server.example.toml").replace("CHANGE-ME", "192.168.1.50")
-            + "\n[playlists]\nmin_players = { \"*\" = 2, coop = 3 }\n";
-        let cfg: Config = toml::from_str(&text).unwrap();
-        let mins: Vec<_> = cfg
-            .playlists
-            .min_players
-            .iter()
-            .map(|(k, v)| (k.as_str(), *v))
-            .collect();
-        assert_eq!(mins, [("*", 2), ("coop", 3)]);
-    }
-
-    #[test]
-    fn public_host_must_be_reachable() {
-        assert!(check_public_host("192.168.1.50").is_ok());
-        assert!(check_public_host("server.example.lan").is_ok());
-        for bad in ["", "0.0.0.0", "::", "CHANGE-ME", "a b"] {
-            assert!(check_public_host(bad).is_err(), "{bad:?} must be rejected");
-        }
-    }
-}
+mod tests;

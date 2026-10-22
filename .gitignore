@@ -10,3 +10,5 @@ target/
 storage/
 # Server logs.
 logs/
+# Local agent settings.
+.claude/settings.local.json
